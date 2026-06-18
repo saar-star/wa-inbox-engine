@@ -15,12 +15,12 @@ import fs from 'fs';
 import path from 'path';
 import qrcode from 'qrcode';
 import pino from 'pino';
-import makeWASocket, {
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore,
-} from '@whiskeysockets/baileys';
+import * as BaileysNS from '@whiskeysockets/baileys';
+// Robust interop: Baileys 6.7 ESM may expose exports on default or namespace.
+const Baileys = (BaileysNS.default && typeof BaileysNS.default === 'object')
+  ? { ...BaileysNS, ...BaileysNS.default } : BaileysNS;
+const makeWASocket = Baileys.makeWASocket || BaileysNS.default;
+const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = Baileys;
 import { Boom } from '@hapi/boom';
 
 const PORT = process.env.PORT || 3000;
@@ -203,8 +203,13 @@ app.post('/accounts', auth, async (req, res) => {
   const name = (req.body.name || id).toString().slice(0, 60);
   if (accounts[id] && accounts[id].status === 'connected')
     return res.json({ id, status: 'connected' });
-  await startAccount(id, name);
-  res.json({ id, name, status: accounts[id].status });
+  try {
+    await startAccount(id, name);
+    res.json({ id, name, status: accounts[id].status });
+  } catch (e) {
+    log.error(e);
+    res.status(500).json({ error: 'start_failed', detail: String(e).slice(0, 200) });
+  }
 });
 
 app.get('/accounts/:id/qr', auth, (req, res) => {
@@ -276,6 +281,10 @@ function wsBroadcast(obj) {
 setInterval(() => {
   wss.clients.forEach((c) => { if (!c.isAlive) return c.terminate(); c.isAlive = false; c.ping(); });
 }, 30000);
+
+// keep the process alive even if a Baileys error escapes
+process.on('uncaughtException', (e) => log.error({ err: String((e && e.stack) || e) }, 'uncaught'));
+process.on('unhandledRejection', (e) => log.error({ err: String(e) }, 'unhandled'));
 
 server.listen(PORT, () => {
   if (!TOKEN) log.warn('WA_API_TOKEN is empty — set it in Railway before exposing publicly!');
