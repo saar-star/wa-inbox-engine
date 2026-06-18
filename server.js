@@ -7,6 +7,9 @@
  *
  * Security: every HTTP/WS call must carry the WA_API_TOKEN (Bearer header or ?token=).
  */
+import { webcrypto } from 'node:crypto';
+// Node 18 has no global Web Crypto; Baileys' hkdf needs it. Polyfill before use.
+if (!globalThis.crypto) globalThis.crypto = webcrypto;
 import express from 'express';
 import cors from 'cors';
 import { WebSocketServer } from 'ws';
@@ -142,7 +145,7 @@ async function startAccount(id, name) {
       } else {
         acc.status = 'reconnecting';
         wsBroadcast({ type: 'status', accountId: id, status: 'reconnecting' });
-        setTimeout(() => startAccount(id, acc.name).catch((e) => log.error(e)), 2500);
+        setTimeout(() => startAccount(id, acc.name).catch((e) => log.error(e)), 3000);
       }
     }
   });
