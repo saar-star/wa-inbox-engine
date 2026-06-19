@@ -36,6 +36,30 @@ const MAX_MSGS_PER_CHAT = 80;
 const log = pino({ level: process.env.LOG_LEVEL || 'warn' });
 fs.mkdirSync(path.join(DATA_DIR, 'auth'), { recursive: true });
 const ACCOUNTS_FILE = path.join(DATA_DIR, 'accounts.json');
+const STATE_FILE = path.join(DATA_DIR, 'state.json'); // persisted chats+messages (survive restarts)
+
+// ---------- chat/message persistence (so a restart/redeploy never wipes the inbox) ----------
+let _saveTimer = null;
+function saveState() {
+  try {
+    const out = {};
+    for (const [id, a] of Object.entries(accounts)) {
+      const msgs = {};
+      for (const [jid, arr] of a.msgs.entries()) msgs[jid] = arr;
+      out[id] = { chats: [...a.chats.values()], msgs };
+    }
+    fs.writeFileSync(STATE_FILE, JSON.stringify(out));
+  } catch (e) { log.error('saveState ' + e); }
+}
+function scheduleSave() { if (_saveTimer) return; _saveTimer = setTimeout(() => { _saveTimer = null; saveState(); }, 4000); }
+function loadStateInto(id, acc) {
+  try {
+    const st = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    const s = st[id]; if (!s) return;
+    if (Array.isArray(s.chats)) for (const c of s.chats) acc.chats.set(c.jid, c);
+    if (s.msgs) for (const jid of Object.keys(s.msgs)) acc.msgs.set(jid, s.msgs[jid]);
+  } catch (e) {}
+}
 
 // ---------- account registry ----------
 function loadAccounts() {
@@ -114,6 +138,7 @@ function recordMessage(acc, m, broadcast = true) {
   if (m.pushName && !chat.name.includes(' ')) chat.name = m.pushName;
   acc.chats.set(jid, chat);
   if (broadcast) wsBroadcast({ type: 'message', accountId: acc.id, message: entry, chat });
+  scheduleSave();
 }
 
 // ---------- baileys connection ----------
@@ -126,6 +151,7 @@ async function startAccount(id, name) {
   const acc = accounts[id] || { id, name: name || id, status: 'connecting', qr: null, me: null, chats: new Map(), msgs: new Map(), raw: new Map() };
   if (!acc.raw) acc.raw = new Map();
   acc.name = name || acc.name; acc.status = 'connecting'; accounts[id] = acc;
+  if (acc.chats.size === 0) loadStateInto(id, acc); // restore persisted chats/messages after a restart
 
   const sock = makeWASocket({
     version,
@@ -181,6 +207,7 @@ async function startAccount(id, name) {
     }
     for (const m of messages) recordMessage(acc, m, false);
     wsBroadcast({ type: 'chats', accountId: id });
+    scheduleSave();
   });
 
   // track archive / unarchive (and pin) changes coming from the phone
@@ -192,6 +219,7 @@ async function startAccount(id, name) {
       if (typeof u.pinned !== 'undefined') c.pinned = !!u.pinned;
     }
     wsBroadcast({ type: 'chats', accountId: id });
+    scheduleSave();
   });
 
   sock.ev.on('messages.upsert', ({ messages, type }) => {
@@ -330,7 +358,7 @@ app.get('/accounts/:id/messages', auth, (req, res) => {
   if (!jid) return res.status(400).json({ error: 'jid_required' });
   const arr = a.msgs.get(jid) || [];
   const chat = a.chats.get(jid);
-  if (chat) { chat.unread = 0; acc_touch(a); }   // mark read on open
+  if (chat) { chat.unread = 0; acc_touch(a); scheduleSave(); }
   res.json(arr.slice(-(parseInt(req.query.limit) || 60)));
 });
 
@@ -419,6 +447,11 @@ function wsBroadcast(obj) {
 setInterval(() => {
   wss.clients.forEach((c) => { if (!c.isAlive) return c.terminate(); c.isAlive = false; c.ping(); });
 }, 30000);
+
+// periodic + on-exit persistence so chats survive restarts/redeploys
+setInterval(saveState, 60000);
+process.on('SIGTERM', () => { try { saveState(); } catch (e) {} process.exit(0); });
+process.on('SIGINT', () => { try { saveState(); } catch (e) {} process.exit(0); });
 
 // keep the process alive even if a Baileys error escapes
 process.on('uncaughtException', (e) => log.error({ err: String((e && e.stack) || e) }, 'uncaught'));
