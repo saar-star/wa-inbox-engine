@@ -56,7 +56,7 @@ function loadStateInto(id, acc) {
   try {
     const st = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
     const s = st[id]; if (!s) return;
-    if (Array.isArray(s.chats)) for (const c of s.chats) acc.chats.set(c.jid, c);
+    if (Array.isArray(s.chats)) for (const c of s.chats) { if (isBadName(c.name)) c.name = niceName(c.jid); acc.chats.set(c.jid, c); }
     if (s.msgs) for (const jid of Object.keys(s.msgs)) acc.msgs.set(jid, s.msgs[jid]);
   } catch (e) {}
 }
@@ -99,6 +99,17 @@ function mediaInfo(m) {
   if (c.documentMessage) return { type: 'document', mime: c.documentMessage.mimetype || 'application/octet-stream', name: c.documentMessage.fileName || 'document' };
   return null;
 }
+// human-friendly fallback name from a jid (when no pushName/contact name is known)
+function niceName(jid) {
+  if (!jid) return '';
+  const n = jid.split('@')[0];
+  if (jid.endsWith('@s.whatsapp.net')) return '+' + n;
+  if (jid.endsWith('@g.us')) return 'קבוצה';
+  if (jid.endsWith('@newsletter')) return 'ערוץ';
+  if (jid.endsWith('@lid')) return 'איש קשר';
+  return n;
+}
+function isBadName(s) { return !s || /^\d{6,}$/.test(s) || s === 'קבוצה' || s === 'ערוץ' || s === 'איש קשר' || /^\+\d+$/.test(s); }
 function tsOf(m) {
   const t = m.messageTimestamp;
   if (!t) return Date.now();
@@ -132,10 +143,11 @@ function recordMessage(acc, m, broadcast = true) {
     arr.sort((a, b) => a.ts - b.ts);
     if (arr.length > MAX_MSGS_PER_CHAT) arr.splice(0, arr.length - MAX_MSGS_PER_CHAT);
   }
-  const chat = acc.chats.get(jid) || { jid, name: jid.split('@')[0], unread: 0, ts: 0, last: '' };
+  const chat = acc.chats.get(jid) || { jid, name: niceName(jid), unread: 0, ts: 0, last: '' };
   if (entry.ts >= chat.ts) { chat.ts = entry.ts; chat.last = text; }
-  if (!entry.fromMe) chat.unread = (chat.unread || 0) + 1;
-  if (m.pushName && !chat.name.includes(' ')) chat.name = m.pushName;
+  if (!entry.fromMe && broadcast) chat.unread = (chat.unread || 0) + 1; // count only live messages, never history
+  if (!jid.endsWith('@g.us') && m.pushName && m.pushName.trim()) chat.name = m.pushName.trim();
+  else if (isBadName(chat.name)) chat.name = niceName(jid);
   acc.chats.set(jid, chat);
   if (broadcast) wsBroadcast({ type: 'message', accountId: acc.id, message: entry, chat });
   scheduleSave();
@@ -198,8 +210,9 @@ async function startAccount(id, name) {
   sock.ev.on('messaging-history.set', ({ chats = [], messages = [] }) => {
     for (const ch of chats) {
       if (!ch.id || ch.id === 'status@broadcast') continue;
-      const ex = acc.chats.get(ch.id) || { jid: ch.id, name: ch.name || ch.id.split('@')[0], unread: 0, ts: 0, last: '' };
-      ex.name = ch.name || ex.name;
+      const ex = acc.chats.get(ch.id) || { jid: ch.id, name: '', unread: 0, ts: 0, last: '' };
+      if (ch.name && ch.name.trim()) ex.name = ch.name.trim();
+      else if (isBadName(ex.name)) ex.name = niceName(ch.id);
       if (typeof ch.unreadCount === 'number') ex.unread = ch.unreadCount;
       if (typeof ch.archived !== 'undefined') ex.archived = !!ch.archived;
       if (typeof ch.pinned !== 'undefined') ex.pinned = !!ch.pinned;
