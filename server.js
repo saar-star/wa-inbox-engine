@@ -24,6 +24,7 @@ const Baileys = (BaileysNS.default && typeof BaileysNS.default === 'object')
   ? { ...BaileysNS, ...BaileysNS.default } : BaileysNS;
 const makeWASocket = Baileys.makeWASocket || BaileysNS.default;
 const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = Baileys;
+const downloadMediaMessage = Baileys.downloadMediaMessage;
 import { Boom } from '@hapi/boom';
 
 const PORT = process.env.PORT || 3000;
@@ -65,6 +66,15 @@ function msgText(m) {
     ''
   );
 }
+function mediaInfo(m) {
+  const c = (m && m.message) || {};
+  if (c.imageMessage)    return { type: 'image',    mime: c.imageMessage.mimetype || 'image/jpeg' };
+  if (c.videoMessage)    return { type: 'video',    mime: c.videoMessage.mimetype || 'video/mp4' };
+  if (c.audioMessage)    return { type: 'audio',    mime: c.audioMessage.mimetype || 'audio/ogg' };
+  if (c.stickerMessage)  return { type: 'sticker',  mime: 'image/webp' };
+  if (c.documentMessage) return { type: 'document', mime: c.documentMessage.mimetype || 'application/octet-stream', name: c.documentMessage.fileName || 'document' };
+  return null;
+}
 function tsOf(m) {
   const t = m.messageTimestamp;
   if (!t) return Date.now();
@@ -84,6 +94,13 @@ function recordMessage(acc, m, broadcast = true) {
     text,
     ts: tsOf(m),
   };
+  const mi = mediaInfo(m);
+  if (mi) {
+    entry.media = { type: mi.type, mime: mi.mime, name: mi.name || null };
+    if (!acc.raw) acc.raw = new Map();
+    acc.raw.set(entry.id, m);
+    if (acc.raw.size > 400) { const k = acc.raw.keys().next().value; acc.raw.delete(k); }
+  }
   if (!acc.msgs.has(jid)) acc.msgs.set(jid, []);
   const arr = acc.msgs.get(jid);
   if (!arr.find((x) => x.id === entry.id)) {
@@ -106,7 +123,8 @@ async function startAccount(id, name) {
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
 
-  const acc = accounts[id] || { id, name: name || id, status: 'connecting', qr: null, me: null, chats: new Map(), msgs: new Map() };
+  const acc = accounts[id] || { id, name: name || id, status: 'connecting', qr: null, me: null, chats: new Map(), msgs: new Map(), raw: new Map() };
+  if (!acc.raw) acc.raw = new Map();
   acc.name = name || acc.name; acc.status = 'connecting'; accounts[id] = acc;
 
   const sock = makeWASocket({
@@ -145,7 +163,7 @@ async function startAccount(id, name) {
       } else {
         acc.status = 'reconnecting';
         wsBroadcast({ type: 'status', accountId: id, status: 'reconnecting' });
-        setTimeout(() => startAccount(id, acc.name).catch((e) => log.error(e)), 3000);
+        setTimeout(() => startAccount(id, acc.name).catch((e) => log.error(e)), 2500);
       }
     }
   });
@@ -157,9 +175,22 @@ async function startAccount(id, name) {
       const ex = acc.chats.get(ch.id) || { jid: ch.id, name: ch.name || ch.id.split('@')[0], unread: 0, ts: 0, last: '' };
       ex.name = ch.name || ex.name;
       if (typeof ch.unreadCount === 'number') ex.unread = ch.unreadCount;
+      if (typeof ch.archived !== 'undefined') ex.archived = !!ch.archived;
+      if (typeof ch.pinned !== 'undefined') ex.pinned = !!ch.pinned;
       acc.chats.set(ch.id, ex);
     }
     for (const m of messages) recordMessage(acc, m, false);
+    wsBroadcast({ type: 'chats', accountId: id });
+  });
+
+  // track archive / unarchive (and pin) changes coming from the phone
+  sock.ev.on('chats.update', (updates) => {
+    for (const u of updates || []) {
+      const c = acc.chats.get(u.id);
+      if (!c) continue;
+      if (typeof u.archived !== 'undefined') c.archived = !!u.archived;
+      if (typeof u.pinned !== 'undefined') c.pinned = !!u.pinned;
+    }
     wsBroadcast({ type: 'chats', accountId: id });
   });
 
@@ -182,7 +213,7 @@ async function bootstrap() {
 // ---------- http api ----------
 const app = express();
 app.use(cors({ origin: ALLOW_ORIGIN }));
-app.use(express.json());
+app.use(express.json({ limit: '30mb' }));
 
 function auth(req, res, next) {
   const h = req.headers.authorization || '';
@@ -215,6 +246,59 @@ app.post('/accounts', auth, async (req, res) => {
   }
 });
 
+// rename an account (custom label set by the user)
+app.patch('/accounts/:id', auth, (req, res) => {
+  const a = accounts[req.params.id];
+  if (!a) return res.status(404).json({ error: 'no_account' });
+  const name = (req.body && req.body.name ? String(req.body.name) : '').slice(0, 60).trim();
+  if (!name) return res.status(400).json({ error: 'name_required' });
+  a.name = name;
+  saveAccounts(accounts);
+  wsBroadcast({ type: 'status', accountId: a.id, status: a.status, name });
+  res.json({ ok: true, id: a.id, name });
+});
+
+// compact digest for Herzl: connected accounts + recent chats (+ optional recent messages)
+app.get('/digest', auth, (req, res) => {
+  const perAcc = parseInt(req.query.chats) || 35;
+  const withMsgs = req.query.msgs === '1';
+  const out = Object.values(accounts).map((a) => {
+    const chats = [...a.chats.values()].sort((x, y) => y.ts - x.ts).slice(0, perAcc).map((c) => {
+      const o = { name: c.name, unread: c.unread || 0, last: (c.last || '').slice(0, 120),
+        ts: c.ts, time: c.ts ? new Date(c.ts).toISOString() : null };
+      if (withMsgs) {
+        const arr = a.msgs.get(c.jid) || [];
+        o.recent = arr.slice(-6).map((m) => ({ from: m.fromMe ? 'me' : (m.author || ''), text: (m.text || '').slice(0, 200), time: new Date(m.ts).toISOString() }));
+      }
+      return o;
+    });
+    return { id: a.id, name: a.name, status: a.status,
+      totalChats: a.chats.size,
+      totalUnread: [...a.chats.values()].reduce((s, c) => s + (c.unread || 0), 0),
+      chats };
+  });
+  res.json(out);
+});
+
+// search messages across all chats of an account by text
+app.get('/accounts/:id/search', auth, (req, res) => {
+  const a = accounts[req.params.id];
+  if (!a) return res.status(404).json({ error: 'no_account' });
+  const q = String(req.query.q || '').toLowerCase().trim();
+  if (!q) return res.status(400).json({ error: 'q_required' });
+  const hits = [];
+  for (const [jid, arr] of a.msgs.entries()) {
+    const chat = a.chats.get(jid);
+    for (const m of arr) {
+      if ((m.text || '').toLowerCase().includes(q)) {
+        hits.push({ chat: chat ? chat.name : jid.split('@')[0], jid, from: m.fromMe ? 'me' : (m.author || ''), text: m.text, ts: m.ts });
+      }
+    }
+  }
+  hits.sort((x, y) => y.ts - x.ts);
+  res.json(hits.slice(0, parseInt(req.query.limit) || 50));
+});
+
 app.get('/accounts/:id/qr', auth, (req, res) => {
   const a = accounts[req.params.id];
   if (!a) return res.status(404).json({ error: 'no_account' });
@@ -224,8 +308,19 @@ app.get('/accounts/:id/qr', auth, (req, res) => {
 app.get('/accounts/:id/chats', auth, (req, res) => {
   const a = accounts[req.params.id];
   if (!a) return res.status(404).json({ error: 'no_account' });
-  const list = [...a.chats.values()].sort((x, y) => y.ts - x.ts).slice(0, 200);
+  let list = [...a.chats.values()];
+  const arch = req.query.archived;
+  if (arch === '1') list = list.filter((c) => c.archived);
+  else if (arch !== 'all') list = list.filter((c) => !c.archived);
+  list = list.sort((x, y) => y.ts - x.ts).slice(0, 300);
   res.json(list);
+});
+
+// count of archived chats (for the "Archived" row in the UI)
+app.get('/accounts/:id/archived-count', auth, (req, res) => {
+  const a = accounts[req.params.id];
+  if (!a) return res.status(404).json({ error: 'no_account' });
+  res.json({ count: [...a.chats.values()].filter((c) => c.archived).length });
 });
 
 app.get('/accounts/:id/messages', auth, (req, res) => {
@@ -235,7 +330,7 @@ app.get('/accounts/:id/messages', auth, (req, res) => {
   if (!jid) return res.status(400).json({ error: 'jid_required' });
   const arr = a.msgs.get(jid) || [];
   const chat = a.chats.get(jid);
-  if (chat) { chat.unread = 0; acc_touch(a); }
+  if (chat) { chat.unread = 0; acc_touch(a); }   // mark read on open
   res.json(arr.slice(-(parseInt(req.query.limit) || 60)));
 });
 
@@ -251,6 +346,46 @@ app.post('/accounts/:id/send', auth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: 'send_failed', detail: String(e).slice(0, 200) });
+  }
+});
+
+// download media for a stored message (returns binary with content-type)
+app.get('/accounts/:id/media', auth, async (req, res) => {
+  const a = accounts[req.params.id];
+  if (!a) return res.status(404).json({ error: 'no_account' });
+  const m = a.raw && a.raw.get(req.query.mid);
+  if (!m) return res.status(404).json({ error: 'no_media' });
+  try {
+    const buf = await downloadMediaMessage(m, 'buffer', {}, { logger: log, reuploadRequest: a.sock && a.sock.updateMediaMessage });
+    const mi = mediaInfo(m) || { mime: 'application/octet-stream' };
+    res.setHeader('Content-Type', mi.mime);
+    res.setHeader('Cache-Control', 'private, max-age=86400');
+    if (mi.name && mi.type === 'document') res.setHeader('Content-Disposition', 'inline; filename="' + encodeURIComponent(mi.name) + '"');
+    res.end(buf);
+  } catch (e) {
+    res.status(500).json({ error: 'download_failed', detail: String(e).slice(0, 150) });
+  }
+});
+
+// send media (image / video / document) — base64 data URL or raw base64
+app.post('/accounts/:id/sendMedia', auth, async (req, res) => {
+  const a = accounts[req.params.id];
+  if (!a || !a.sock) return res.status(404).json({ error: 'no_account' });
+  if (a.status !== 'connected') return res.status(409).json({ error: 'not_connected', status: a.status });
+  const { jid, data, mime, caption, kind, fileName } = req.body || {};
+  if (!jid || !data) return res.status(400).json({ error: 'jid_and_data_required' });
+  try {
+    const buf = Buffer.from(String(data).replace(/^data:[^;]+;base64,/, ''), 'base64');
+    const k = kind || ((mime || '').startsWith('video') ? 'video' : (mime || '').startsWith('image') ? 'image' : 'document');
+    let msg;
+    if (k === 'image') msg = { image: buf, caption: caption || '' };
+    else if (k === 'video') msg = { video: buf, caption: caption || '' };
+    else msg = { document: buf, mimetype: mime || 'application/octet-stream', fileName: fileName || 'file' };
+    const sent = await a.sock.sendMessage(jid, msg);
+    recordMessage(a, sent, true);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'send_failed', detail: String(e).slice(0, 150) });
   }
 });
 
