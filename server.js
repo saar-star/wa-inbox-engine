@@ -1,9 +1,9 @@
 /**
- * WA Inbox Engine — multi-account WhatsApp client (read + manual reply)
+ * WA Inbox Engine â multi-account WhatsApp client (read + manual reply)
  * For the Herzl dashboard. Baileys-based. REST + WebSocket. Always-on (Railway).
  *
  * This is NOT an auto-responder bot. It only mirrors your chats and sends
- * messages that YOU trigger from the dashboard — like WhatsApp Web, multi-account.
+ * messages that YOU trigger from the dashboard â like WhatsApp Web, multi-account.
  *
  * Security: every HTTP/WS call must carry the WA_API_TOKEN (Bearer header or ?token=).
  */
@@ -28,7 +28,7 @@ const downloadMediaMessage = Baileys.downloadMediaMessage;
 import { Boom } from '@hapi/boom';
 
 const PORT = process.env.PORT || 3000;
-const TOKEN = process.env.WA_API_TOKEN || '';            // REQUIRED — set in Railway
+const TOKEN = process.env.WA_API_TOKEN || '';            // REQUIRED â set in Railway
 const DATA_DIR = process.env.DATA_DIR || './data';        // mount a Railway volume here
 const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || '*';     // e.g. https://control.alaw.co.il
 const MAX_MSGS_PER_CHAT = 80;
@@ -104,12 +104,11 @@ function niceName(jid) {
   if (!jid) return '';
   const n = jid.split('@')[0];
   if (jid.endsWith('@s.whatsapp.net')) return '+' + n;
-  if (jid.endsWith('@g.us')) return 'קבוצה';
-  if (jid.endsWith('@newsletter')) return 'ערוץ';
-  if (jid.endsWith('@lid')) return 'איש קשר';
-  return n;
+  if (jid.endsWith('@g.us')) return '×§×××¦×';
+  if (jid.endsWith('@newsletter')) return '×¢×¨××¥';
+  return n; // @lid or other: show the identifier number (real phone shown separately when known)
 }
-function isBadName(s) { return !s || /^\d{6,}$/.test(s) || s === 'קבוצה' || s === 'ערוץ' || s === 'איש קשר' || /^\+\d+$/.test(s); }
+function isBadName(s) { return !s || /^\d{6,}$/.test(s) || s === '×§×××¦×' || s === '×¢×¨××¥' || s === '×××© ×§×©×¨'; }
 function tsOf(m) {
   const t = m.messageTimestamp;
   if (!t) return Date.now();
@@ -146,8 +145,16 @@ function recordMessage(acc, m, broadcast = true) {
   const chat = acc.chats.get(jid) || { jid, name: niceName(jid), unread: 0, ts: 0, last: '' };
   if (entry.ts >= chat.ts) { chat.ts = entry.ts; chat.last = text; }
   if (!entry.fromMe && broadcast) chat.unread = (chat.unread || 0) + 1; // count only live messages, never history
+  // try to capture the real phone behind a LID-only contact (WhatsApp exposes it in *Alt fields when known)
+  if (!chat.phone) {
+    const cand = (m.key && (m.key.remoteJidAlt || m.key.participantAlt || m.key.participant)) || m.participant || '';
+    if (/@s\.whatsapp\.net$/.test(cand)) chat.phone = cand.split('@')[0];
+    else if (jid.endsWith('@s.whatsapp.net')) chat.phone = jid.split('@')[0];
+  }
+  const cn = acc.contacts && acc.contacts.get(jid);
   if (!jid.endsWith('@g.us') && m.pushName && m.pushName.trim()) chat.name = m.pushName.trim();
-  else if (isBadName(chat.name)) chat.name = niceName(jid);
+  else if (cn && cn.trim() && !/^\d{5,}$/.test(cn)) chat.name = cn.trim();
+  else if (isBadName(chat.name)) chat.name = chat.phone ? ('+' + chat.phone) : niceName(jid);
   acc.chats.set(jid, chat);
   if (broadcast) wsBroadcast({ type: 'message', accountId: acc.id, message: entry, chat });
   scheduleSave();
@@ -160,8 +167,9 @@ async function startAccount(id, name) {
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
 
-  const acc = accounts[id] || { id, name: name || id, status: 'connecting', qr: null, me: null, chats: new Map(), msgs: new Map(), raw: new Map() };
+  const acc = accounts[id] || { id, name: name || id, status: 'connecting', qr: null, me: null, chats: new Map(), msgs: new Map(), raw: new Map(), contacts: new Map() };
   if (!acc.raw) acc.raw = new Map();
+  if (!acc.contacts) acc.contacts = new Map();
   acc.name = name || acc.name; acc.status = 'connecting'; accounts[id] = acc;
   if (acc.chats.size === 0) loadStateInto(id, acc); // restore persisted chats/messages after a restart
 
@@ -206,7 +214,7 @@ async function startAccount(id, name) {
     }
   });
 
-  // history sync on first login → populate chats/messages
+  // history sync on first login â populate chats/messages
   sock.ev.on('messaging-history.set', ({ chats = [], messages = [] }) => {
     for (const ch of chats) {
       if (!ch.id || ch.id === 'status@broadcast') continue;
@@ -239,6 +247,24 @@ async function startAccount(id, name) {
     if (type !== 'notify' && type !== 'append') return;
     for (const m of messages) recordMessage(acc, m, true);
   });
+
+  // contact name sync (so chats show real names like the official app, not LID numbers)
+  const onContacts = (list) => {
+    let changed = false;
+    for (const c of (list || [])) {
+      if (!c || !c.id) continue;
+      const nm = c.name || c.notify || c.verifiedName;
+      if (nm && nm.trim()) {
+        acc.contacts.set(c.id, nm.trim());
+        const ex = acc.chats.get(c.id);
+        if (ex && isBadName(ex.name)) { ex.name = nm.trim(); changed = true; }
+      }
+    }
+    if (changed) { wsBroadcast({ type: 'chats', accountId: id }); scheduleSave(); }
+  };
+  sock.ev.on('contacts.upsert', onContacts);
+  sock.ev.on('contacts.set', (a) => onContacts(a && a.contacts ? a.contacts : a));
+  sock.ev.on('contacts.update', onContacts);
 
   return acc;
 }
@@ -371,7 +397,7 @@ app.get('/accounts/:id/messages', auth, (req, res) => {
   if (!jid) return res.status(400).json({ error: 'jid_required' });
   const arr = a.msgs.get(jid) || [];
   const chat = a.chats.get(jid);
-  if (chat) { chat.unread = 0; acc_touch(a); scheduleSave(); }
+  if (chat) { chat.unread = 0; acc_touch(a); }   // mark read on open
   res.json(arr.slice(-(parseInt(req.query.limit) || 60)));
 });
 
@@ -408,7 +434,7 @@ app.get('/accounts/:id/media', auth, async (req, res) => {
   }
 });
 
-// send media (image / video / document) — base64 data URL or raw base64
+// send media (image / video / document) â base64 data URL or raw base64
 app.post('/accounts/:id/sendMedia', auth, async (req, res) => {
   const a = accounts[req.params.id];
   if (!a || !a.sock) return res.status(404).json({ error: 'no_account' });
@@ -471,7 +497,7 @@ process.on('uncaughtException', (e) => log.error({ err: String((e && e.stack) ||
 process.on('unhandledRejection', (e) => log.error({ err: String(e) }, 'unhandled'));
 
 server.listen(PORT, () => {
-  if (!TOKEN) log.warn('WA_API_TOKEN is empty — set it in Railway before exposing publicly!');
+  if (!TOKEN) log.warn('WA_API_TOKEN is empty â set it in Railway before exposing publicly!');
   log.warn('WA Inbox Engine listening on :' + PORT);
   bootstrap().catch((e) => log.error(e));
 });
