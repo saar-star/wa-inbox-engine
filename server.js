@@ -179,7 +179,7 @@ async function startAccount(id, name) {
     printQRInTerminal: false,
     auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, log) },
     markOnlineOnConnect: false,
-    syncFullHistory: false,
+    syncFullHistory: true,
     browser: ['Herzl Inbox', 'Chrome', '1.0'],
   });
   acc.sock = sock;
@@ -323,6 +323,21 @@ app.patch('/accounts/:id', auth, (req, res) => {
   saveAccounts(accounts);
   wsBroadcast({ type: 'status', accountId: a.id, status: a.status, name });
   res.json({ ok: true, id: a.id, name });
+});
+
+// proactive re-sync: pull the address book (contact names) + chat metadata (archive) from WhatsApp app-state
+app.post('/accounts/:id/sync', auth, async (req, res) => {
+  const a = accounts[req.params.id];
+  if (!a || !a.sock) return res.status(404).json({ error: 'no_account' });
+  if (a.status !== 'connected') return res.status(409).json({ error: 'not_connected', status: a.status });
+  try {
+    await a.sock.resyncAppState(['critical_unblock_low', 'regular_high', 'regular_low'], false);
+    wsBroadcast({ type: 'chats', accountId: a.id });
+    scheduleSave();
+    res.json({ ok: true, contacts: a.contacts ? a.contacts.size : 0, chats: a.chats.size });
+  } catch (e) {
+    res.status(500).json({ error: 'sync_failed', detail: String(e).slice(0, 200) });
+  }
 });
 
 // compact digest for Herzl: connected accounts + recent chats (+ optional recent messages)
