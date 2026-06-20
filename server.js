@@ -1,9 +1,9 @@
 /**
- * WA Inbox Engine â multi-account WhatsApp client (read + manual reply)
+ * WA Inbox Engine — multi-account WhatsApp client (read + manual reply)
  * For the Herzl dashboard. Baileys-based. REST + WebSocket. Always-on (Railway).
  *
  * This is NOT an auto-responder bot. It only mirrors your chats and sends
- * messages that YOU trigger from the dashboard â like WhatsApp Web, multi-account.
+ * messages that YOU trigger from the dashboard — like WhatsApp Web, multi-account.
  *
  * Security: every HTTP/WS call must carry the WA_API_TOKEN (Bearer header or ?token=).
  */
@@ -28,7 +28,7 @@ const downloadMediaMessage = Baileys.downloadMediaMessage;
 import { Boom } from '@hapi/boom';
 
 const PORT = process.env.PORT || 3000;
-const TOKEN = process.env.WA_API_TOKEN || '';            // REQUIRED â set in Railway
+const TOKEN = process.env.WA_API_TOKEN || '';            // REQUIRED — set in Railway
 const DATA_DIR = process.env.DATA_DIR || './data';        // mount a Railway volume here
 const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || '*';     // e.g. https://control.alaw.co.il
 const MAX_MSGS_PER_CHAT = 80;
@@ -104,11 +104,11 @@ function niceName(jid) {
   if (!jid) return '';
   const n = jid.split('@')[0];
   if (jid.endsWith('@s.whatsapp.net')) return '+' + n;
-  if (jid.endsWith('@g.us')) return '×§×××¦×';
-  if (jid.endsWith('@newsletter')) return '×¢×¨××¥';
+  if (jid.endsWith('@g.us')) return 'קבוצה';
+  if (jid.endsWith('@newsletter')) return 'ערוץ';
   return n; // @lid or other: show the identifier number (real phone shown separately when known)
 }
-function isBadName(s) { return !s || /^\d{6,}$/.test(s) || s === '×§×××¦×' || s === '×¢×¨××¥' || s === '×××© ×§×©×¨'; }
+function isBadName(s) { return !s || /^\d{6,}$/.test(s) || s === 'קבוצה' || s === 'ערוץ' || s === 'איש קשר'; }
 function tsOf(m) {
   const t = m.messageTimestamp;
   if (!t) return Date.now();
@@ -214,7 +214,7 @@ async function startAccount(id, name) {
     }
   });
 
-  // history sync on first login â populate chats/messages
+  // history sync on first login → populate chats/messages
   sock.ev.on('messaging-history.set', ({ chats = [], messages = [] }) => {
     for (const ch of chats) {
       if (!ch.id || ch.id === 'status@broadcast') continue;
@@ -434,7 +434,7 @@ app.get('/accounts/:id/media', auth, async (req, res) => {
   }
 });
 
-// send media (image / video / document) â base64 data URL or raw base64
+// send media (image / video / document) — base64 data URL or raw base64
 app.post('/accounts/:id/sendMedia', auth, async (req, res) => {
   const a = accounts[req.params.id];
   if (!a || !a.sock) return res.status(404).json({ error: 'no_account' });
@@ -497,7 +497,7 @@ process.on('uncaughtException', (e) => log.error({ err: String((e && e.stack) ||
 process.on('unhandledRejection', (e) => log.error({ err: String(e) }, 'unhandled'));
 
 server.listen(PORT, () => {
-  if (!TOKEN) log.warn('WA_API_TOKEN is empty â set it in Railway before exposing publicly!');
+  if (!TOKEN) log.warn('WA_API_TOKEN is empty — set it in Railway before exposing publicly!');
   log.warn('WA Inbox Engine listening on :' + PORT);
   bootstrap().catch((e) => log.error(e));
 });
