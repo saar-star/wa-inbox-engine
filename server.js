@@ -125,6 +125,7 @@ function recordMessage(acc, m, broadcast = true) {
     jid,
     fromMe: !!m.key.fromMe,
     author: m.pushName || (m.key.fromMe ? 'You' : jid.split('@')[0]),
+    sender: (m.key && m.key.participant) || '',
     text,
     ts: tsOf(m),
   };
@@ -152,7 +153,7 @@ function recordMessage(acc, m, broadcast = true) {
     else if (jid.endsWith('@s.whatsapp.net')) chat.phone = jid.split('@')[0];
   }
   const cn = acc.contacts && acc.contacts.get(jid);
-  if (!jid.endsWith('@g.us') && m.pushName && m.pushName.trim()) chat.name = m.pushName.trim();
+  if (!jid.endsWith('@g.us') && !m.key.fromMe && m.pushName && m.pushName.trim()) chat.name = m.pushName.trim();
   else if (cn && cn.trim() && !/^\d{5,}$/.test(cn)) chat.name = cn.trim();
   else if (isBadName(chat.name)) chat.name = chat.phone ? ('+' + chat.phone) : niceName(jid);
   acc.chats.set(jid, chat);
@@ -199,6 +200,17 @@ async function startAccount(id, name) {
       acc.me = sock.user ? { id: sock.user.id, name: sock.user.name } : null;
       saveAccounts(accounts);
       wsBroadcast({ type: 'status', accountId: id, status: 'connected', me: acc.me });
+      // pull real group names (subjects) for every group we're in
+      try {
+        const groups = await sock.groupFetchAllParticipating();
+        let n = 0;
+        for (const gid of Object.keys(groups || {})) {
+          const meta = groups[gid]; if (!meta || !meta.subject) continue;
+          const c = acc.chats.get(gid) || { jid: gid, name: '', unread: 0, ts: 0, last: '' };
+          c.name = meta.subject; acc.chats.set(gid, c); n++;
+        }
+        if (n) { wsBroadcast({ type: 'chats', accountId: id }); scheduleSave(); }
+      } catch (e) { log.error({ err: String(e) }, 'groupFetchAllParticipating failed'); }
     }
     if (connection === 'close') {
       const code = (lastDisconnect && lastDisconnect.error instanceof Boom)
@@ -244,6 +256,18 @@ async function startAccount(id, name) {
     wsBroadcast({ type: 'chats', accountId: id });
     scheduleSave();
   });
+
+  // group subject changes (rename) → update chat name
+  sock.ev.on('groups.update', (updates) => {
+    let changed = false;
+    for (const u of (updates || [])) {
+      if (!u.id || !u.subject) continue;
+      const c = acc.chats.get(u.id) || { jid: u.id, name: '', unread: 0, ts: 0, last: '' };
+      c.name = u.subject; acc.chats.set(u.id, c); changed = true;
+    }
+    if (changed) { wsBroadcast({ type: 'chats', accountId: id }); scheduleSave(); }
+  });
+  sock.ev.on('group-participants.update', () => {});
 
   sock.ev.on('messages.upsert', ({ messages, type }) => {
     if (type !== 'notify' && type !== 'append') return;
@@ -379,8 +403,19 @@ app.post('/accounts/:id/chat-action', auth, async (req, res) => {
   if (!jid || !action) return res.status(400).json({ error: 'jid_and_action_required' });
   const chat = a.chats.get(jid);
   const arr = a.msgs.get(jid) || [];
-  const last = arr[arr.length - 1];
-  const lastMessages = last ? [{ key: { remoteJid: jid, id: last.id, fromMe: !!last.fromMe }, messageTimestamp: Math.floor(last.ts / 1000) }] : [];
+  const isGroup = jid.endsWith('@g.us');
+  // groups require key.participant on non-fromMe messages; prefer a fromMe msg or one with a known sender
+  let last = arr[arr.length - 1];
+  if (isGroup && last && !last.fromMe && !last.sender) {
+    const good = [...arr].reverse().find((x) => x.fromMe || x.sender);
+    if (good) last = good;
+  }
+  let lastMessages = [];
+  if (last) {
+    const key = { remoteJid: jid, id: last.id, fromMe: !!last.fromMe };
+    if (isGroup && !last.fromMe) key.participant = last.sender || a.me && a.me.id || jid;
+    lastMessages = [{ key, messageTimestamp: Math.floor(last.ts / 1000) }];
+  }
   try {
     let mod;
     if (action === 'pin') mod = { pin: !!value };
