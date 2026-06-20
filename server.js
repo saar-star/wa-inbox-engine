@@ -385,7 +385,7 @@ app.post('/accounts/:id/sync', auth, async (req, res) => {
   if (!a || !a.sock) return res.status(404).json({ error: 'no_account' });
   if (a.status !== 'connected') return res.status(409).json({ error: 'not_connected', status: a.status });
   try {
-    await a.sock.resyncAppState(['critical_unblock_low', 'regular_high', 'regular_low'], false);
+    await a.sock.resyncAppState(['critical_unblock_low', 'critical_block', 'regular_high', 'regular_low', 'regular'], true);
     wsBroadcast({ type: 'chats', accountId: a.id });
     scheduleSave();
     res.json({ ok: true, contacts: a.contacts ? a.contacts.size : 0, chats: a.chats.size });
@@ -424,7 +424,16 @@ app.post('/accounts/:id/chat-action', auth, async (req, res) => {
     else if (action === 'read') mod = { markRead: value !== false, lastMessages };
     else if (action === 'delete') mod = { delete: true, lastMessages };
     else return res.status(400).json({ error: 'bad_action' });
-    await a.sock.chatModify(mod, jid);
+    try {
+      await a.sock.chatModify(mod, jid);
+    } catch (e1) {
+      // missing app-state key → force a full resync (fromScratch) and retry once
+      if (/myAppStateKey|not present|key.*not/i.test(String(e1))) {
+        try { await a.sock.resyncAppState(['critical_unblock_low', 'critical_block', 'regular_high', 'regular_low', 'regular'], true); } catch (e2) {}
+        await new Promise((r) => setTimeout(r, 1500));
+        await a.sock.chatModify(mod, jid);
+      } else { throw e1; }
+    }
     if (chat) {
       if (action === 'pin') chat.pinned = !!value;
       else if (action === 'mute') chat.muted = value ? (Date.now() + Number(value)) : 0;
