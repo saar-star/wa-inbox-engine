@@ -147,7 +147,7 @@ function recordMessage(acc, m, broadcast = true) {
   if (!entry.fromMe && broadcast) chat.unread = (chat.unread || 0) + 1; // count only live messages, never history
   // try to capture the real phone behind a LID-only contact (WhatsApp exposes it in *Alt fields when known)
   if (!chat.phone) {
-    const cand = (m.key && (m.key.remoteJidAlt || m.key.participantAlt || m.key.participant)) || m.participant || '';
+    const cand = (m.key && (m.key.senderPn || m.key.participantPn || m.key.remoteJidAlt || m.key.participantAlt || m.key.participant)) || m.participant || m.senderPn || '';
     if (/@s\.whatsapp\.net$/.test(cand)) chat.phone = cand.split('@')[0];
     else if (jid.endsWith('@s.whatsapp.net')) chat.phone = jid.split('@')[0];
   }
@@ -224,6 +224,7 @@ async function startAccount(id, name) {
       if (typeof ch.unreadCount === 'number') ex.unread = ch.unreadCount;
       if (typeof ch.archived !== 'undefined') ex.archived = !!ch.archived;
       if (typeof ch.pinned !== 'undefined') ex.pinned = !!ch.pinned;
+      if (ch.muteEndTime) ex.muted = Number(ch.muteEndTime) * 1000;
       acc.chats.set(ch.id, ex);
     }
     for (const m of messages) recordMessage(acc, m, false);
@@ -238,6 +239,7 @@ async function startAccount(id, name) {
       if (!c) continue;
       if (typeof u.archived !== 'undefined') c.archived = !!u.archived;
       if (typeof u.pinned !== 'undefined') c.pinned = !!u.pinned;
+      if (typeof u.mute !== 'undefined') c.muted = u.mute ? Number(u.mute) : 0;
     }
     wsBroadcast({ type: 'chats', accountId: id });
     scheduleSave();
@@ -340,6 +342,41 @@ app.post('/accounts/:id/sync', auth, async (req, res) => {
   }
 });
 
+// chat actions (pin / archive / mute / read / delete) — mirrors to WhatsApp via chatModify
+app.post('/accounts/:id/chat-action', auth, async (req, res) => {
+  const a = accounts[req.params.id];
+  if (!a || !a.sock) return res.status(404).json({ error: 'no_account' });
+  if (a.status !== 'connected') return res.status(409).json({ error: 'not_connected', status: a.status });
+  const { jid, action, value } = req.body || {};
+  if (!jid || !action) return res.status(400).json({ error: 'jid_and_action_required' });
+  const chat = a.chats.get(jid);
+  const arr = a.msgs.get(jid) || [];
+  const last = arr[arr.length - 1];
+  const lastMessages = last ? [{ key: { remoteJid: jid, id: last.id, fromMe: !!last.fromMe }, messageTimestamp: Math.floor(last.ts / 1000) }] : [];
+  try {
+    let mod;
+    if (action === 'pin') mod = { pin: !!value };
+    else if (action === 'mute') mod = { mute: value ? Number(value) : null };
+    else if (action === 'archive') mod = { archive: !!value, lastMessages };
+    else if (action === 'read') mod = { markRead: value !== false, lastMessages };
+    else if (action === 'delete') mod = { delete: true, lastMessages };
+    else return res.status(400).json({ error: 'bad_action' });
+    await a.sock.chatModify(mod, jid);
+    if (chat) {
+      if (action === 'pin') chat.pinned = !!value;
+      else if (action === 'mute') chat.muted = value ? (Date.now() + Number(value)) : 0;
+      else if (action === 'archive') chat.archived = !!value;
+      else if (action === 'read') chat.unread = (value === false) ? (chat.unread || 1) : 0;
+      else if (action === 'delete') a.chats.delete(jid);
+    }
+    wsBroadcast({ type: 'chats', accountId: a.id });
+    scheduleSave();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'action_failed', detail: String(e).slice(0, 200) });
+  }
+});
+
 // compact digest for Herzl: connected accounts + recent chats (+ optional recent messages)
 app.get('/digest', auth, (req, res) => {
   const perAcc = parseInt(req.query.chats) || 35;
@@ -394,7 +431,7 @@ app.get('/accounts/:id/chats', auth, (req, res) => {
   const arch = req.query.archived;
   if (arch === '1') list = list.filter((c) => c.archived);
   else if (arch !== 'all') list = list.filter((c) => !c.archived);
-  list = list.sort((x, y) => y.ts - x.ts).slice(0, 300);
+  list = list.sort((x, y) => ((y.pinned ? 1 : 0) - (x.pinned ? 1 : 0)) || (y.ts - x.ts)).slice(0, 300);
   res.json(list);
 });
 
