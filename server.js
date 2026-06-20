@@ -250,6 +250,34 @@ async function startAccount(id, name) {
     for (const m of messages) recordMessage(acc, m, true);
   });
 
+  // emoji reactions arriving from the phone → attach to the stored message
+  sock.ev.on('messages.reaction', (reactions) => {
+    let changed = false;
+    for (const r of (reactions || [])) {
+      const jid = r.key && r.key.remoteJid; if (!jid) continue;
+      const arr = acc.msgs.get(jid); if (!arr) continue;
+      const e = arr.find((x) => x.id === r.key.id); if (!e) continue;
+      const t = r.reaction && r.reaction.text;
+      if (t) e.reaction = t; else delete e.reaction;
+      changed = true;
+    }
+    if (changed) { wsBroadcast({ type: 'chats', accountId: id }); scheduleSave(); }
+  });
+
+  // message deleted-for-everyone (revoke) coming from the phone
+  sock.ev.on('messages.update', (updates) => {
+    let changed = false;
+    for (const u of (updates || [])) {
+      const jid = u.key && u.key.remoteJid; if (!jid) continue;
+      const revoked = u.update && (u.update.message === null || (u.update.messageStubType && String(u.update.messageStubType).includes('REVOKE')));
+      if (!revoked) continue;
+      const arr = acc.msgs.get(jid); if (!arr) continue;
+      const e = arr.find((x) => x.id === u.key.id); if (!e) continue;
+      e.text = '🚫 ההודעה נמחקה'; e.media = null; delete e.reaction; changed = true;
+    }
+    if (changed) { wsBroadcast({ type: 'chats', accountId: id }); scheduleSave(); }
+  });
+
   // contact name sync (so chats show real names like the official app, not LID numbers)
   const onContacts = (list) => {
     let changed = false;
@@ -377,6 +405,48 @@ app.post('/accounts/:id/chat-action', auth, async (req, res) => {
   }
 });
 
+// react to a message with an emoji (empty emoji removes the reaction)
+app.post('/accounts/:id/react', auth, async (req, res) => {
+  const a = accounts[req.params.id];
+  if (!a || !a.sock) return res.status(404).json({ error: 'no_account' });
+  if (a.status !== 'connected') return res.status(409).json({ error: 'not_connected', status: a.status });
+  const { jid, msgId, fromMe, emoji } = req.body || {};
+  if (!jid || !msgId) return res.status(400).json({ error: 'jid_and_msgId_required' });
+  try {
+    const key = { remoteJid: jid, id: msgId, fromMe: fromMe === true || fromMe === 'true' };
+    await a.sock.sendMessage(jid, { react: { text: emoji || '', key } });
+    const arr = a.msgs.get(jid) || [];
+    const e = arr.find((x) => x.id === msgId);
+    if (e) { if (emoji) e.reaction = emoji; else delete e.reaction; }
+    wsBroadcast({ type: 'chats', accountId: a.id });
+    scheduleSave();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'react_failed', detail: String(e).slice(0, 200) });
+  }
+});
+
+// delete a message for everyone (revoke)
+app.post('/accounts/:id/msg-delete', auth, async (req, res) => {
+  const a = accounts[req.params.id];
+  if (!a || !a.sock) return res.status(404).json({ error: 'no_account' });
+  if (a.status !== 'connected') return res.status(409).json({ error: 'not_connected', status: a.status });
+  const { jid, msgId, fromMe } = req.body || {};
+  if (!jid || !msgId) return res.status(400).json({ error: 'jid_and_msgId_required' });
+  try {
+    const key = { remoteJid: jid, id: msgId, fromMe: fromMe === true || fromMe === 'true' };
+    await a.sock.sendMessage(jid, { delete: key });
+    const arr = a.msgs.get(jid) || [];
+    const e = arr.find((x) => x.id === msgId);
+    if (e) { e.text = '🚫 ההודעה נמחקה'; e.media = null; delete e.reaction; }
+    wsBroadcast({ type: 'chats', accountId: a.id });
+    scheduleSave();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'delete_failed', detail: String(e).slice(0, 200) });
+  }
+});
+
 // compact digest for Herzl: connected accounts + recent chats (+ optional recent messages)
 app.get('/digest', auth, (req, res) => {
   const perAcc = parseInt(req.query.chats) || 35;
@@ -457,10 +527,16 @@ app.post('/accounts/:id/send', auth, async (req, res) => {
   const a = accounts[req.params.id];
   if (!a || !a.sock) return res.status(404).json({ error: 'no_account' });
   if (a.status !== 'connected') return res.status(409).json({ error: 'not_connected', status: a.status });
-  const { jid, text } = req.body || {};
+  const { jid, text, quotedId } = req.body || {};
   if (!jid || !text) return res.status(400).json({ error: 'jid_and_text_required' });
   try {
-    const sent = await a.sock.sendMessage(jid, { text: String(text) });
+    const opts = {};
+    if (quotedId) {
+      const arr = a.msgs.get(jid) || [];
+      const q = arr.find((x) => x.id === quotedId);
+      if (q) opts.quoted = { key: { remoteJid: jid, id: q.id, fromMe: !!q.fromMe }, message: { conversation: q.text || '' } };
+    }
+    const sent = await a.sock.sendMessage(jid, { text: String(text) }, opts);
     recordMessage(a, sent, true);
     res.json({ ok: true });
   } catch (e) {
